@@ -6,7 +6,7 @@
     msg: >-
       This playbook does not support --check (credentials, shell, and UFW cannot be dry-run safely).
       Test SSH with: ansible vps -m ping
-      Deploy with: ansible-playbook playbooks/vless-reality.yml
+      Deploy with: ansible-playbook playbooks/setup-vless-reality.yml
   when: ansible_check_mode
 
 # === 1. System prep ===

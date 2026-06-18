@@ -15,11 +15,23 @@ cp inventory/hosts.yml.example inventory/hosts.yml
 
 # 3. Deploy
 ansible vps -m ping
-ansible-playbook playbooks/vless-reality.yml
+ansible-playbook playbooks/setup-vless-reality.yml
 
 # 4. Connect
 # import output/my-vps-client-config.json into Nekoray / v2rayN / Hiddify / v2rayNG
 ```
+
+## Add another client
+
+If you need to add an extra client to your server:
+
+```bash
+ansible-playbook playbooks/add-another-vless-client.yml -e client_name=john
+```
+
+Output: `output/my-vps-john-client-config.json`
+
+Do not re-run `setup-vless-reality.yml` after adding clients — it resets the server to a single client.
 
 ## Requirements
 

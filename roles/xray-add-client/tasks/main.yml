@@ -1,0 +1,134 @@
+---
+- name: Refuse check mode
+  ansible.builtin.fail:
+    msg: "Use: ansible-playbook playbooks/add-another-vless-client.yml -e client_name=my-phone"
+  when: ansible_check_mode
+
+- name: Validate client name
+  ansible.builtin.assert:
+    that:
+      - xray_client_name is defined
+      - xray_client_name | length > 0
+      - xray_client_name is match('^[a-zA-Z0-9][a-zA-Z0-9_-]*$')
+    fail_msg: "Pass -e client_name=NAME (letters, numbers, hyphen, underscore)."
+
+- name: Check if xray binary exists
+  ansible.builtin.stat:
+    path: "{{ xray_binary }}"
+  register: xray_binary_stat
+
+- name: Fail if Xray is not installed
+  ansible.builtin.fail:
+    msg: "Xray is not installed. Run playbooks/setup-vless-reality.yml first."
+  when: not xray_binary_stat.stat.exists
+
+- name: Check existing credentials file
+  ansible.builtin.stat:
+    path: "{{ xray_credentials_path }}"
+  register: xray_credentials_stat
+
+- name: Fail if credentials file is missing
+  ansible.builtin.fail:
+    msg: "Credentials not found at {{ xray_credentials_path }}. Run playbooks/setup-vless-reality.yml first."
+  when: not xray_credentials_stat.stat.exists
+
+- name: Read server credentials
+  ansible.builtin.slurp:
+    src: "{{ xray_credentials_path }}"
+  register: xray_credentials_slurp
+
+- name: Set server credential facts
+  ansible.builtin.set_fact:
+    xray_primary_client_uuid: "{{ creds.client_uuid }}"
+    xray_private_key: "{{ creds.private_key }}"
+    xray_public_key: "{{ creds.public_key }}"
+    xray_short_id: "{{ creds.short_id }}"
+  vars:
+    creds: "{{ xray_credentials_slurp.content | b64decode | from_yaml }}"
+
+- name: Check extra clients registry
+  ansible.builtin.stat:
+    path: "{{ xray_clients_registry_path }}"
+  register: xray_extra_clients_stat
+
+- name: Read extra clients registry
+  ansible.builtin.slurp:
+    src: "{{ xray_clients_registry_path }}"
+  register: xray_extra_clients_slurp
+  when: xray_extra_clients_stat.stat.exists
+
+- name: Set extra clients list
+  ansible.builtin.set_fact:
+    xray_extra_clients: "{{ _registry.clients | default([]) }}"
+  vars:
+    _registry: >-
+      {{
+        (xray_extra_clients_slurp.content | b64decode | from_yaml)
+        if (xray_extra_clients_stat.stat.exists and not (xray_extra_clients_slurp.skipped | default(false)))
+        else {'clients': []}
+      }}
+
+- name: Fail if client name already exists
+  ansible.builtin.fail:
+    msg: "Client '{{ xray_client_name }}' already exists. Pick another name."
+  when: xray_client_name in (xray_extra_clients | map(attribute='name') | list)
+
+- name: Generate UUID for new client
+  ansible.builtin.command: "{{ xray_binary }} uuid"
+  register: xray_new_client_uuid_cmd
+  changed_when: true
+
+- name: Add new client to registry
+  ansible.builtin.set_fact:
+    xray_new_client_uuid: "{{ xray_new_client_uuid_cmd.stdout | trim }}"
+    xray_extra_clients: >-
+      {{
+        xray_extra_clients + [{'name': xray_client_name, 'uuid': xray_new_client_uuid_cmd.stdout | trim}]
+      }}
+
+- name: Save extra clients registry
+  ansible.builtin.copy:
+    dest: "{{ xray_clients_registry_path }}"
+    mode: "0600"
+    content: |
+      ---
+      clients:
+      {% for client in xray_extra_clients %}
+        - name: {{ client.name }}
+          uuid: {{ client.uuid }}
+      {% endfor %}
+
+- name: Deploy updated server config
+  ansible.builtin.template:
+    src: server-config.json.j2
+    dest: "{{ xray_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: "{{ xray_binary }} run -test -config %s"
+
+- name: Restart xray to apply config
+  ansible.builtin.systemd:
+    name: xray
+    state: restarted
+    daemon_reload: true
+
+- name: Ensure local output directory exists
+  ansible.builtin.file:
+    path: "{{ xray_local_output_dir }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+
+- name: Save new client config locally
+  ansible.builtin.template:
+    src: client-config.json.j2
+    dest: "{{ xray_local_output_dir }}/{{ inventory_hostname }}-{{ xray_client_name }}-client-config.json"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+
+- name: Show client config path
+  ansible.builtin.debug:
+    msg: "Client config saved to: {{ xray_local_output_dir }}/{{ inventory_hostname }}-{{ xray_client_name }}-client-config.json"

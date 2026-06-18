@@ -1,0 +1,26 @@
+---
+# Add a VLESS client to an existing server.
+#
+# Usage:
+#   ansible-playbook playbooks/add-another-vless-client.yml -e client_name=john
+
+- name: Add VLESS client
+  hosts: vps
+  gather_facts: true
+
+  vars_files:
+    - ../inventory/group_vars/vps/xray.yml
+
+  vars:
+    xray_client_name: "{{ client_name }}"
+
+  pre_tasks:
+    - name: Require client_name
+      ansible.builtin.assert:
+        that:
+          - client_name is defined
+          - client_name | length > 0
+        fail_msg: "Pass -e client_name=NAME (example: -e client_name=john)"
+
+  roles:
+    - role: xray-add-client

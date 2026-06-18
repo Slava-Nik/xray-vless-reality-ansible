@@ -1,0 +1,2 @@
+---
+xray_clients_registry_path: /etc/xray/.ansible-extra-clients.yml

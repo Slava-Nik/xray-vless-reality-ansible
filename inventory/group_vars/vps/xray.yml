@@ -1,0 +1,20 @@
+---
+# Shared Xray settings for playbooks targeting the vps group.
+# Override per host in inventory/hosts.yml if needed.
+
+xray_config_path: /usr/local/etc/xray/config.json
+xray_binary: /usr/local/bin/xray
+xray_credentials_path: /etc/xray/.ansible-credentials
+xray_log_dir: /var/log/xray
+
+xray_reality_dest: "www.cloudflare.com:443"
+xray_reality_server_names:
+  - "www.cloudflare.com"
+xray_reality_show: false
+xray_reality_xver: 0
+
+xray_client_flow: "xtls-rprx-vision"
+xray_client_fingerprint: "chrome"
+xray_client_outbound_tag: "vless-reality"
+
+xray_local_output_dir: "{{ playbook_dir }}/../output"
