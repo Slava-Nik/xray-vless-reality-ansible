@@ -1,0 +1,184 @@
+---
+# === 1. System prep ===
+
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - ufw
+      - openssl
+    state: present
+
+- name: Enable IPv4 forwarding
+  ansible.posix.sysctl:
+    name: net.ipv4.ip_forward
+    value: "1"
+    sysctl_set: true
+    state: present
+    reload: true
+  when: xray_enable_ip_forward
+
+# === 2. Firewall ===
+
+- name: Allow SSH through UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ xray_ssh_port }}"
+    proto: tcp
+  when: xray_configure_ufw
+
+- name: Allow Xray port through UFW
+  community.general.ufw:
+    rule: allow
+    port: "443"
+    proto: tcp
+  when: xray_configure_ufw
+
+- name: Set UFW defaults (deny incoming, allow outgoing)
+  community.general.ufw:
+    direction: "{{ item.direction }}"
+    policy: "{{ item.policy }}"
+  loop:
+    - { direction: incoming, policy: deny }
+    - { direction: outgoing, policy: allow }
+  when: xray_configure_ufw
+
+- name: Enable UFW
+  community.general.ufw:
+    state: enabled
+  when: xray_configure_ufw
+
+# === 3. Install Xray ===
+
+- name: Check if xray is installed
+  ansible.builtin.command: xray version
+  register: xray_version_check
+  changed_when: false
+  failed_when: false
+
+- name: Install Xray via official script if not installed
+  ansible.builtin.shell: |
+    set -euo pipefail
+    bash <(curl -Ls {{ xray_install_script_url }})
+  args:
+    executable: /bin/bash
+  when: xray_version_check.rc != 0
+
+- name: Create xray log directory if not exists
+  ansible.builtin.file:
+    path: "{{ xray_log_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Create credentials directory if not exists
+  ansible.builtin.file:
+    path: "{{ xray_credentials_path | dirname }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0700"
+
+# === 4. Keys and UUID (generated once, then reused) ===
+
+- name: Check existing credentials file
+  ansible.builtin.stat:
+    path: "{{ xray_credentials_path }}"
+  register: xray_credentials_stat
+
+- name: Load existing credentials
+  ansible.builtin.slurp:
+    src: "{{ xray_credentials_path }}"
+  register: xray_credentials_slurp
+  when: xray_credentials_stat.stat.exists
+
+- name: Parse existing credentials and set facts (variables)
+  ansible.builtin.set_fact:
+    xray_client_uuid: "{{ (xray_credentials_slurp.content | b64decode | from_yaml).client_uuid }}"
+    xray_private_key: "{{ (xray_credentials_slurp.content | b64decode | from_yaml).private_key }}"
+    xray_public_key: "{{ (xray_credentials_slurp.content | b64decode | from_yaml).public_key }}"
+    xray_short_id: "{{ (xray_credentials_slurp.content | b64decode | from_yaml).short_id }}"
+  when: xray_credentials_stat.stat.exists
+
+- name: Generate x25519 keypair and parse output
+  ansible.builtin.shell: |
+    set -euo pipefail
+    out=$(xray x25519)
+    private=$(echo "$out" | grep -iE '^Private' | head -1 | sed 's/.*: *//')
+    public=$(echo "$out" | grep -iE '^(Public|Password)' | head -1 | sed 's/.*: *//')
+    uuid=$(xray uuid | tr -d '[:space:]')
+    short_id=$(openssl rand -hex 4)
+    printf 'private_key: %s\npublic_key: %s\nclient_uuid: %s\nshort_id: %s\n' \
+      "$private" "$public" "$uuid" "$short_id"
+  args:
+    executable: /bin/bash
+  register: xray_new_credentials
+  changed_when: true
+  when: not xray_credentials_stat.stat.exists
+
+- name: Set new credential facts
+  ansible.builtin.set_fact:
+    xray_private_key: "{{ (xray_new_credentials.stdout | from_yaml).private_key }}"
+    xray_public_key: "{{ (xray_new_credentials.stdout | from_yaml).public_key }}"
+    xray_client_uuid: "{{ (xray_new_credentials.stdout | from_yaml).client_uuid }}"
+    xray_short_id: "{{ (xray_new_credentials.stdout | from_yaml).short_id }}"
+  when: not xray_credentials_stat.stat.exists
+
+- name: Save credentials on server
+  ansible.builtin.copy:
+    dest: "{{ xray_credentials_path }}"
+    mode: "0600"
+    content: |
+      ---
+      client_uuid: {{ xray_client_uuid }}
+      private_key: {{ xray_private_key }}
+      public_key: {{ xray_public_key }}
+      short_id: {{ xray_short_id }}
+  when: not xray_credentials_stat.stat.exists
+
+# === 5. Server config ===
+
+- name: Deploy Xray server config
+  ansible.builtin.template:
+    src: server-config.json.j2
+    dest: "{{ xray_config_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+    validate: xray run -test -config %s
+  notify: Restart xray
+
+- name: Enable and start xray
+  ansible.builtin.systemd:
+    name: xray
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# === 6. Client config (saved locally) ===
+
+- name: Ensure local output directory exists
+  ansible.builtin.file:
+    path: "{{ xray_local_output_dir }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  become: false
+
+- name: Save client config locally
+  ansible.builtin.template:
+    src: client-config.json.j2
+    dest: "{{ xray_local_output_dir }}/{{ inventory_hostname }}-client-config.json"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+
+- name: Show client config path
+  ansible.builtin.debug:
+    msg: "Done. Client config saved to: {{ xray_local_output_dir }}/{{ inventory_hostname }}-client-config.json"
