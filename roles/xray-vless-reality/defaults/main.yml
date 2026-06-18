@@ -1,5 +1,6 @@
 ---
 xray_config_path: /usr/local/etc/xray/config.json
+xray_binary: /usr/local/bin/xray
 xray_credentials_path: /etc/xray/.ansible-credentials
 xray_log_dir: /var/log/xray
 xray_install_script_url: "https://github.com/XTLS/Xray-install/raw/main/install-release.sh"

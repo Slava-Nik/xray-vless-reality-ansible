@@ -1,4 +1,14 @@
 ---
+# === 0. Guard ===
+
+- name: Refuse check mode
+  ansible.builtin.fail:
+    msg: >-
+      This playbook does not support --check (credentials, shell, and UFW cannot be dry-run safely).
+      Test SSH with: ansible vps -m ping
+      Deploy with: ansible-playbook playbooks/vless-reality.yml
+  when: ansible_check_mode
+
 # === 1. System prep ===
 
 - name: Update apt cache
@@ -23,51 +33,20 @@
     reload: true
   when: xray_enable_ip_forward
 
-# === 2. Firewall ===
+# === 2. Install Xray ===
 
-- name: Allow SSH through UFW
-  community.general.ufw:
-    rule: allow
-    port: "{{ xray_ssh_port }}"
-    proto: tcp
-  when: xray_configure_ufw
+- name: Check if xray binary exists
+  ansible.builtin.stat:
+    path: "{{ xray_binary }}"
+  register: xray_binary_stat
 
-- name: Allow Xray port through UFW
-  community.general.ufw:
-    rule: allow
-    port: "443"
-    proto: tcp
-  when: xray_configure_ufw
-
-- name: Set UFW defaults (deny incoming, allow outgoing)
-  community.general.ufw:
-    direction: "{{ item.direction }}"
-    policy: "{{ item.policy }}"
-  loop:
-    - { direction: incoming, policy: deny }
-    - { direction: outgoing, policy: allow }
-  when: xray_configure_ufw
-
-- name: Enable UFW
-  community.general.ufw:
-    state: enabled
-  when: xray_configure_ufw
-
-# === 3. Install Xray ===
-
-- name: Check if xray is installed
-  ansible.builtin.command: xray version
-  register: xray_version_check
-  changed_when: false
-  failed_when: false
-
-- name: Install Xray via official script if not installed
+- name: Install Xray via official script
   ansible.builtin.shell: |
     set -euo pipefail
     bash <(curl -Ls {{ xray_install_script_url }})
   args:
     executable: /bin/bash
-  when: xray_version_check.rc != 0
+  when: not xray_binary_stat.stat.exists
 
 - name: Create xray log directory if not exists
   ansible.builtin.file:
@@ -87,60 +66,91 @@
 
 # === 4. Keys and UUID (generated once, then reused) ===
 
-- name: Check existing credentials file
-  ansible.builtin.stat:
-    path: "{{ xray_credentials_path }}"
-  register: xray_credentials_stat
+- name: Ensure credentials on server
+  block:
+    - name: Check existing credentials file
+      ansible.builtin.stat:
+        path: "{{ xray_credentials_path }}"
+      register: xray_credentials_stat
 
-- name: Load existing credentials
-  ansible.builtin.slurp:
-    src: "{{ xray_credentials_path }}"
-  register: xray_credentials_slurp
-  when: xray_credentials_stat.stat.exists
+    - name: Read existing credentials file
+      ansible.builtin.slurp:
+        src: "{{ xray_credentials_path }}"
+      register: xray_credentials_slurp
+      when: xray_credentials_stat.stat.exists
 
-- name: Parse existing credentials and set facts (variables)
-  ansible.builtin.set_fact:
-    xray_client_uuid: "{{ (xray_credentials_slurp.content | b64decode | from_yaml).client_uuid }}"
-    xray_private_key: "{{ (xray_credentials_slurp.content | b64decode | from_yaml).private_key }}"
-    xray_public_key: "{{ (xray_credentials_slurp.content | b64decode | from_yaml).public_key }}"
-    xray_short_id: "{{ (xray_credentials_slurp.content | b64decode | from_yaml).short_id }}"
-  when: xray_credentials_stat.stat.exists
+    - name: Decide whether credentials need generation
+      ansible.builtin.set_fact:
+        xray_credentials_need_generate: "{{ _need_generate }}"
+      vars:
+        _parsed: >-
+          {{
+            (xray_credentials_slurp.content | b64decode | from_yaml)
+            if (xray_credentials_stat.stat.exists and not (xray_credentials_slurp.skipped | default(false)))
+            else none
+          }}
+        _need_generate: >-
+          {{
+            _parsed is none
+            or _parsed.client_uuid is not defined
+            or (_parsed.client_uuid | default('') | trim) == ''
+            or (_parsed.private_key | default('') | trim) == ''
+            or (_parsed.public_key | default('') | trim) == ''
+            or (_parsed.short_id | default('') | trim) == ''
+          }}
 
-- name: Generate x25519 keypair and parse output
-  ansible.builtin.shell: |
-    set -euo pipefail
-    out=$(xray x25519)
-    private=$(echo "$out" | grep -iE '^Private' | head -1 | sed 's/.*: *//')
-    public=$(echo "$out" | grep -iE '^(Public|Password)' | head -1 | sed 's/.*: *//')
-    uuid=$(xray uuid | tr -d '[:space:]')
-    short_id=$(openssl rand -hex 4)
-    printf 'private_key: %s\npublic_key: %s\nclient_uuid: %s\nshort_id: %s\n' \
-      "$private" "$public" "$uuid" "$short_id"
-  args:
-    executable: /bin/bash
-  register: xray_new_credentials
-  changed_when: true
-  when: not xray_credentials_stat.stat.exists
+    - name: Remove invalid credentials file
+      ansible.builtin.file:
+        path: "{{ xray_credentials_path }}"
+        state: absent
+      when:
+        - xray_credentials_need_generate
+        - xray_credentials_stat.stat.exists
 
-- name: Set new credential facts
-  ansible.builtin.set_fact:
-    xray_private_key: "{{ (xray_new_credentials.stdout | from_yaml).private_key }}"
-    xray_public_key: "{{ (xray_new_credentials.stdout | from_yaml).public_key }}"
-    xray_client_uuid: "{{ (xray_new_credentials.stdout | from_yaml).client_uuid }}"
-    xray_short_id: "{{ (xray_new_credentials.stdout | from_yaml).short_id }}"
-  when: not xray_credentials_stat.stat.exists
+    - name: Generate credentials file
+      ansible.builtin.shell: |
+        set -euo pipefail
+        XRAY="{{ xray_binary }}"
+        CREDS="{{ xray_credentials_path }}"
+        out=$("$XRAY" x25519 2>&1)
+        private=$(echo "$out" | awk -F': *' 'tolower($1) ~ /private/ {print $2; exit}')
+        public=$(echo "$out" | awk -F': *' 'tolower($1) ~ /password|public/ {print $2; exit}' | awk '{print $1}')
+        uuid=$("$XRAY" uuid | tr -d '[:space:]')
+        short_id=$(openssl rand -hex 4)
+        if [[ -z "$private" || -z "$public" || -z "$uuid" ]]; then
+          echo "Failed to parse x25519 output:" >&2
+          echo "$out" >&2
+          exit 1
+        fi
+        umask 077
+        printf -- '---\nclient_uuid: %s\nprivate_key: %s\npublic_key: %s\nshort_id: %s\n' \
+          "$uuid" "$private" "$public" "$short_id" > "$CREDS"
+      args:
+        executable: /bin/bash
+      when: xray_credentials_need_generate
 
-- name: Save credentials on server
-  ansible.builtin.copy:
-    dest: "{{ xray_credentials_path }}"
-    mode: "0600"
-    content: |
-      ---
-      client_uuid: {{ xray_client_uuid }}
-      private_key: {{ xray_private_key }}
-      public_key: {{ xray_public_key }}
-      short_id: {{ xray_short_id }}
-  when: not xray_credentials_stat.stat.exists
+    - name: Read credentials file
+      ansible.builtin.slurp:
+        src: "{{ xray_credentials_path }}"
+      register: xray_credentials_loaded
+
+    - name: Set credential facts
+      ansible.builtin.set_fact:
+        xray_client_uuid: "{{ creds.client_uuid }}"
+        xray_private_key: "{{ creds.private_key }}"
+        xray_public_key: "{{ creds.public_key }}"
+        xray_short_id: "{{ creds.short_id }}"
+      vars:
+        creds: "{{ xray_credentials_loaded.content | b64decode | from_yaml }}"
+
+    - name: Assert credentials are valid
+      ansible.builtin.assert:
+        that:
+          - xray_client_uuid | length > 0
+          - xray_private_key | length > 0
+          - xray_public_key | length > 0
+          - xray_short_id | length > 0
+        fail_msg: "Credentials file is missing required fields after generation."
 
 # === 5. Server config ===
 
@@ -151,7 +161,7 @@
     owner: root
     group: root
     mode: "0644"
-    validate: xray run -test -config %s
+    validate: "{{ xray_binary }} run -test -config %s"
   notify: Restart xray
 
 - name: Enable and start xray
@@ -182,3 +192,37 @@
 - name: Show client config path
   ansible.builtin.debug:
     msg: "Done. Client config saved to: {{ xray_local_output_dir }}/{{ inventory_hostname }}-client-config.json"
+
+# === 7. Firewall ===
+
+- name: Configure UFW
+  when: xray_configure_ufw
+  block:
+    - name: Allow OpenSSH through UFW
+      community.general.ufw:
+        rule: allow
+        name: OpenSSH
+
+    - name: Allow SSH port through UFW
+      community.general.ufw:
+        rule: allow
+        port: "{{ xray_ssh_port }}"
+        proto: tcp
+
+    - name: Allow Xray port through UFW
+      community.general.ufw:
+        rule: allow
+        port: "443"
+        proto: tcp
+
+    - name: Set UFW defaults (deny incoming, allow outgoing)
+      community.general.ufw:
+        direction: "{{ item.direction }}"
+        policy: "{{ item.policy }}"
+      loop:
+        - { direction: incoming, policy: deny }
+        - { direction: outgoing, policy: allow }
+
+    - name: Enable UFW
+      community.general.ufw:
+        state: enabled

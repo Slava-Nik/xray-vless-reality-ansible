@@ -4,11 +4,8 @@
 # Run from repo root:
 #   ansible-playbook playbooks/vless-reality.yml
 #
-# Ping hosts:
+# Test SSH:
 #   ansible vps -m ping
-#
-# Dry run:
-#   ansible-playbook playbooks/vless-reality.yml --check
 
 - name: Deploy VLESS + Reality (Xray)
   hosts: vps
