@@ -1,0 +1,1 @@
+vless://{{ xray_client_uuid }}@{{ ansible_host | default(inventory_hostname) }}:443?encryption=none&flow={{ xray_client_flow }}&security=reality&sni={{ xray_reality_server_names[0] }}&fp={{ xray_client_fingerprint }}&pbk={{ xray_public_key }}&sid={{ xray_short_id }}&type=tcp&headerType=none#{{ xray_client_outbound_tag }}

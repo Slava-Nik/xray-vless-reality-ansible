@@ -175,7 +175,7 @@
 
 - name: Ensure local output directory exists
   ansible.builtin.file:
-    path: "{{ xray_local_output_dir }}"
+    path: "{{ xray_client_output_dir }}"
     state: directory
     mode: "0700"
   delegate_to: localhost
@@ -184,14 +184,24 @@
 - name: Save client config locally
   ansible.builtin.template:
     src: client-config.json.j2
-    dest: "{{ xray_local_output_dir }}/{{ inventory_hostname }}-client-config.json"
+    dest: "{{ xray_client_output_dir }}/{{ inventory_hostname }}-client-config.json"
     mode: "0600"
   delegate_to: localhost
   become: false
 
-- name: Show client config path
+- name: Save client happ link locally
+  ansible.builtin.template:
+    src: client-happ.txt.j2
+    dest: "{{ xray_client_output_dir }}/{{ inventory_hostname }}-client-happ.txt"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+
+- name: Show client config paths
   ansible.builtin.debug:
-    msg: "Done. Client config saved to: {{ xray_local_output_dir }}/{{ inventory_hostname }}-client-config.json"
+    msg:
+      - "Done. Client config saved to: {{ xray_client_output_dir }}/{{ inventory_hostname }}-client-config.json"
+      - "Happ link saved to: {{ xray_client_output_dir }}/{{ inventory_hostname }}-client-happ.txt"
 
 # === 7. Firewall ===
 

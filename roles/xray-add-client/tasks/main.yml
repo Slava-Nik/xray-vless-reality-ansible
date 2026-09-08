@@ -68,25 +68,36 @@
         else {'clients': []}
       }}
 
-- name: Fail if client name already exists
-  ansible.builtin.fail:
-    msg: "Client '{{ xray_client_name }}' already exists. Pick another name."
-  when: xray_client_name in (xray_extra_clients | map(attribute='name') | list)
+- name: Detect existing client by name
+  ansible.builtin.set_fact:
+    xray_existing_client: "{{ _matches | first | default(none) }}"
+  vars:
+    _matches: "{{ xray_extra_clients | selectattr('name', 'equalto', xray_client_name) | list }}"
+
+- name: Reuse UUID when client already exists
+  when: xray_existing_client is not none
+  ansible.builtin.set_fact:
+    xray_new_client_uuid: "{{ xray_existing_client.uuid }}"
+    xray_client_already_exists: true
 
 - name: Generate UUID for new client
+  when: xray_existing_client is none
   ansible.builtin.command: "{{ xray_binary }} uuid"
   register: xray_new_client_uuid_cmd
   changed_when: true
 
 - name: Add new client to registry
+  when: xray_existing_client is none
   ansible.builtin.set_fact:
     xray_new_client_uuid: "{{ xray_new_client_uuid_cmd.stdout | trim }}"
+    xray_client_already_exists: false
     xray_extra_clients: >-
       {{
         xray_extra_clients + [{'name': xray_client_name, 'uuid': xray_new_client_uuid_cmd.stdout | trim}]
       }}
 
 - name: Save extra clients registry
+  when: not xray_client_already_exists
   ansible.builtin.copy:
     dest: "{{ xray_clients_registry_path }}"
     mode: "0600"
@@ -99,6 +110,7 @@
       {% endfor %}
 
 - name: Deploy updated server config
+  when: not xray_client_already_exists
   ansible.builtin.template:
     src: server-config.json.j2
     dest: "{{ xray_config_path }}"
@@ -107,15 +119,10 @@
     mode: "0644"
     validate: "{{ xray_binary }} run -test -config %s"
 
-- name: Restart xray to apply config
-  ansible.builtin.systemd:
-    name: xray
-    state: restarted
-    daemon_reload: true
-
+# Save local files before restart — restart can drop Ansible's shared SSH connection.
 - name: Ensure local output directory exists
   ansible.builtin.file:
-    path: "{{ xray_local_output_dir }}"
+    path: "{{ xray_client_output_dir }}"
     state: directory
     mode: "0700"
   delegate_to: localhost
@@ -124,11 +131,53 @@
 - name: Save new client config locally
   ansible.builtin.template:
     src: client-config.json.j2
-    dest: "{{ xray_local_output_dir }}/{{ inventory_hostname }}-{{ xray_client_name }}-client-config.json"
+    dest: "{{ xray_client_output_dir }}/{{ inventory_hostname }}-{{ xray_client_name }}-client-config.json"
     mode: "0600"
   delegate_to: localhost
   become: false
 
-- name: Show client config path
+- name: Save new client happ link locally
+  ansible.builtin.template:
+    src: client-happ.txt.j2
+    dest: "{{ xray_client_output_dir }}/{{ inventory_hostname }}-{{ xray_client_name }}-client-happ.txt"
+    mode: "0600"
+  delegate_to: localhost
+  become: false
+
+- name: Restart xray and recover SSH
+  when: not xray_client_already_exists
+  block:
+    # Async so Ansible does not sit on the shared SSH socket while xray restarts.
+    - name: Restart xray asynchronously
+      ansible.builtin.systemd:
+        name: xray
+        state: restarted
+        daemon_reload: true
+      async: 45
+      poll: 0
+      register: xray_restart_job
+
+    - name: Wait for SSH after xray restart
+      ansible.builtin.wait_for_connection:
+        delay: 2
+        timeout: 60
+
+    - name: Ensure xray restart finished
+      ansible.builtin.async_status:
+        jid: "{{ xray_restart_job.ansible_job_id }}"
+      register: xray_restart_result
+      until: xray_restart_result.finished
+      retries: 30
+      delay: 1
+
+    - name: Confirm xray is running
+      ansible.builtin.systemd:
+        name: xray
+        state: started
+
+- name: Show client config paths
   ansible.builtin.debug:
-    msg: "Client config saved to: {{ xray_local_output_dir }}/{{ inventory_hostname }}-{{ xray_client_name }}-client-config.json"
+    msg:
+      - "{{ 'Client already existed on server; local configs refreshed.' if xray_client_already_exists else 'New client added on server.' }}"
+      - "Client config saved to: {{ xray_client_output_dir }}/{{ inventory_hostname }}-{{ xray_client_name }}-client-config.json"
+      - "Happ link saved to: {{ xray_client_output_dir }}/{{ inventory_hostname }}-{{ xray_client_name }}-client-happ.txt"

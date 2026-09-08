@@ -1,6 +1,6 @@
 # Xray VLESS + Reality (Ansible setup)
 
-One-command deploy of Xray with VLESS + Reality on a VPS. Client config is saved to `output/`.
+One-command deploy of Xray with VLESS + Reality on a VPS. Client configs are saved to `output/<server-ip>/`.
 
 ## Quick start
 
@@ -18,7 +18,8 @@ ansible vps -m ping
 ansible-playbook playbooks/setup-vless-reality.yml
 
 # 4. Connect
-# import output/my-vps-client-config.json into Nekoray / v2rayN / Hiddify / v2rayNG
+# import output/<server-ip>/my-vps-client-config.json into Nekoray / v2rayN / Hiddify / v2rayNG
+# or paste the vless:// link from output/<server-ip>/my-vps-client-happ.txt into Happ
 ```
 
 ## Add another client
@@ -29,7 +30,9 @@ If you need to add an extra client to your server:
 ansible-playbook playbooks/add-another-vless-client.yml -e client_name=john
 ```
 
-Output: `output/my-vps-john-client-config.json`
+Output: `output/<server-ip>/my-vps-john-client-config.json` and `output/<server-ip>/my-vps-john-client-happ.txt`
+
+Re-running with the same `client_name` only refreshes local files (does not recreate the client).
 
 Do not re-run `setup-vless-reality.yml` after adding clients — it resets the server to a single client.
 
