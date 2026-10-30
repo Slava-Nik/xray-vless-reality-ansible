@@ -1,0 +1,73 @@
+---
+# Fail fast: domain, local site, DNS A record
+
+- name: Require vpn_domain
+  ansible.builtin.assert:
+    that:
+      - vpn_domain is defined
+      - (vpn_domain | trim | length) > 0
+      - vpn_domain is match('^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$')
+    fail_msg: >-
+      Set vpn_domain on the host in inventory/hosts.yml
+      (example: vpn_domain: indiegateway.com). Folder sites/<vpn_domain>/ must exist.
+
+- name: Check local camouflage site index
+  ansible.builtin.stat:
+    path: "{{ xray_site_local_dir }}/index.html"
+  register: xray_site_index_stat
+  delegate_to: localhost
+  become: false
+
+- name: Fail if sites/{{ vpn_domain }}/index.html is missing
+  ansible.builtin.assert:
+    that:
+      - xray_site_index_stat.stat.exists
+      - xray_site_index_stat.stat.isreg
+    fail_msg: >-
+      Missing {{ xray_site_local_dir }}/index.html.
+      Put the static site in sites/{{ vpn_domain }}/ before deploy.
+
+- name: Resolve vpn_domain A records
+  ansible.builtin.command:
+    cmd: dig +short A {{ vpn_domain }}
+  register: xray_domain_dig
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  failed_when: false
+
+- name: Fail if DNS A does not point at this VPS
+  ansible.builtin.assert:
+    that:
+      - (ansible_host | string) in (xray_domain_dig.stdout_lines | map('trim') | select('match', '^[0-9.]+$') | list)
+    fail_msg: >-
+      DNS A for {{ vpn_domain }} must include {{ ansible_host }}.
+      Got: {{ xray_domain_dig.stdout | default('(empty)') | trim | default('(empty)') }}.
+      Fix the A record at your registrar, wait for propagation, then re-run.
+
+- name: Resolve www.{{ vpn_domain }} A records
+  ansible.builtin.command:
+    cmd: dig +short A www.{{ vpn_domain }}
+  register: xray_www_dig
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  failed_when: false
+
+- name: Decide Reality / certificate server names
+  ansible.builtin.set_fact:
+    xray_reality_server_names: "{{ _names }}"
+    xray_www_dns_ok: "{{ _www_ok }}"
+  vars:
+    _www_ok: >-
+      {{
+        (ansible_host | string) in (xray_www_dig.stdout_lines | map('trim') | select('match', '^[0-9.]+$') | list)
+      }}
+    _names: "{{ [vpn_domain] + (['www.' ~ vpn_domain] if (_www_ok | bool) else []) }}"
+
+- name: Warn when www DNS is missing
+  ansible.builtin.debug:
+    msg: >-
+      www.{{ vpn_domain }} does not resolve to {{ ansible_host }};
+      certificate and Reality serverNames will use apex only.
+  when: not (xray_www_dns_ok | bool)

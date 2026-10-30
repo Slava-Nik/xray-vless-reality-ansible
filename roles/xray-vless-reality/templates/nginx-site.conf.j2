@@ -1,0 +1,36 @@
+server {
+    listen 80;
+    listen [::]:80;
+    server_name {{ xray_reality_server_names | join(' ') }};
+
+    root {{ xray_site_remote_dir }};
+    index index.html;
+
+    location /.well-known/acme-challenge/ {
+        allow all;
+    }
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+
+{% if xray_ssl_cert_exists | default(false) %}
+server {
+    listen {{ xray_nginx_ssl_listen }} ssl http2;
+    server_name {{ xray_reality_server_names | join(' ') }};
+
+    ssl_certificate     {{ xray_cert_live_dir }}/fullchain.pem;
+    ssl_certificate_key {{ xray_cert_live_dir }}/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    root {{ xray_site_remote_dir }};
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ =404;
+    }
+}
+{% endif %}

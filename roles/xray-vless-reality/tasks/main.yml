@@ -9,6 +9,9 @@
       Deploy with: ansible-playbook playbooks/setup-vless-reality.yml
   when: ansible_check_mode
 
+- name: Include preflight checks
+  ansible.builtin.include_tasks: preflight.yml
+
 # === 1. System prep ===
 
 - name: Update apt cache
@@ -22,6 +25,7 @@
       - curl
       - ufw
       - openssl
+      - dnsutils
     state: present
 
 - name: Enable IPv4 forwarding
@@ -52,9 +56,23 @@
   ansible.builtin.file:
     path: "{{ xray_log_dir }}"
     state: directory
-    owner: root
-    group: root
+    owner: xray
+    group: xray
     mode: "0755"
+
+- name: Ensure xray can write log files
+  ansible.builtin.file:
+    path: "{{ xray_log_dir }}/{{ item }}"
+    state: touch
+    owner: xray
+    group: xray
+    mode: "0640"
+    modification_time: preserve
+    access_time: preserve
+  loop:
+    - access.log
+    - error.log
+  # User=xray in official unit; root-owned logs make restart fail with permission denied.
 
 - name: Create credentials directory if not exists
   ansible.builtin.file:
@@ -64,93 +82,15 @@
     group: root
     mode: "0700"
 
-# === 4. Keys and UUID (generated once, then reused) ===
+# === 3. Camouflage site (nginx + TLS) — before Xray uses dest ===
 
-- name: Ensure credentials on server
-  block:
-    - name: Check existing credentials file
-      ansible.builtin.stat:
-        path: "{{ xray_credentials_path }}"
-      register: xray_credentials_stat
+- name: Include camouflage nginx and certificate
+  ansible.builtin.include_tasks: camouflage.yml
 
-    - name: Read existing credentials file
-      ansible.builtin.slurp:
-        src: "{{ xray_credentials_path }}"
-      register: xray_credentials_slurp
-      when: xray_credentials_stat.stat.exists
+# === 4. Keys and clients ===
 
-    - name: Decide whether credentials need generation
-      ansible.builtin.set_fact:
-        xray_credentials_need_generate: "{{ _need_generate }}"
-      vars:
-        _parsed: >-
-          {{
-            (xray_credentials_slurp.content | b64decode | from_yaml)
-            if (xray_credentials_stat.stat.exists and not (xray_credentials_slurp.skipped | default(false)))
-            else none
-          }}
-        _need_generate: >-
-          {{
-            _parsed is none
-            or _parsed.client_uuid is not defined
-            or (_parsed.client_uuid | default('') | trim) == ''
-            or (_parsed.private_key | default('') | trim) == ''
-            or (_parsed.public_key | default('') | trim) == ''
-            or (_parsed.short_id | default('') | trim) == ''
-          }}
-
-    - name: Remove invalid credentials file
-      ansible.builtin.file:
-        path: "{{ xray_credentials_path }}"
-        state: absent
-      when:
-        - xray_credentials_need_generate
-        - xray_credentials_stat.stat.exists
-
-    - name: Generate credentials file
-      ansible.builtin.shell: |
-        set -euo pipefail
-        XRAY="{{ xray_binary }}"
-        CREDS="{{ xray_credentials_path }}"
-        out=$("$XRAY" x25519 2>&1)
-        private=$(echo "$out" | awk -F': *' 'tolower($1) ~ /private/ {print $2; exit}')
-        public=$(echo "$out" | awk -F': *' 'tolower($1) ~ /password|public/ {print $2; exit}' | awk '{print $1}')
-        uuid=$("$XRAY" uuid | tr -d '[:space:]')
-        short_id=$(openssl rand -hex 4)
-        if [[ -z "$private" || -z "$public" || -z "$uuid" ]]; then
-          echo "Failed to parse x25519 output:" >&2
-          echo "$out" >&2
-          exit 1
-        fi
-        umask 077
-        printf -- '---\nclient_uuid: %s\nprivate_key: %s\npublic_key: %s\nshort_id: %s\n' \
-          "$uuid" "$private" "$public" "$short_id" > "$CREDS"
-      args:
-        executable: /bin/bash
-      when: xray_credentials_need_generate
-
-    - name: Read credentials file
-      ansible.builtin.slurp:
-        src: "{{ xray_credentials_path }}"
-      register: xray_credentials_loaded
-
-    - name: Set credential facts
-      ansible.builtin.set_fact:
-        xray_client_uuid: "{{ creds.client_uuid }}"
-        xray_private_key: "{{ creds.private_key }}"
-        xray_public_key: "{{ creds.public_key }}"
-        xray_short_id: "{{ creds.short_id }}"
-      vars:
-        creds: "{{ xray_credentials_loaded.content | b64decode | from_yaml }}"
-
-    - name: Assert credentials are valid
-      ansible.builtin.assert:
-        that:
-          - xray_client_uuid | length > 0
-          - xray_private_key | length > 0
-          - xray_public_key | length > 0
-          - xray_short_id | length > 0
-        fail_msg: "Credentials file is missing required fields after generation."
+- name: Include credentials and default clients
+  ansible.builtin.include_tasks: credentials.yml
 
 # === 5. Server config ===
 
@@ -171,7 +111,7 @@
     state: started
     daemon_reload: true
 
-# === 6. Client config (saved locally) ===
+# === 6. Client configs (saved locally) ===
 
 - name: Ensure local output directory exists
   ansible.builtin.file:
@@ -181,27 +121,26 @@
   delegate_to: localhost
   become: false
 
-- name: Save client config locally
-  ansible.builtin.template:
-    src: client-config.json.j2
-    dest: "{{ xray_client_output_dir }}/{{ inventory_hostname }}-client-config.json"
-    mode: "0600"
-  delegate_to: localhost
-  become: false
-
-- name: Save client happ link locally
+- name: Save client happ links locally
   ansible.builtin.template:
     src: client-happ.txt.j2
-    dest: "{{ xray_client_output_dir }}/{{ inventory_hostname }}-client-happ.txt"
+    dest: "{{ xray_client_output_dir }}/{{ inventory_hostname }}-{{ client.name }}-client-happ.txt"
     mode: "0600"
+  loop: "{{ xray_clients }}"
+  loop_control:
+    loop_var: client
   delegate_to: localhost
   become: false
 
-- name: Show client config paths
+- name: Show client happ paths
   ansible.builtin.debug:
-    msg:
-      - "Done. Client config saved to: {{ xray_client_output_dir }}/{{ inventory_hostname }}-client-config.json"
-      - "Happ link saved to: {{ xray_client_output_dir }}/{{ inventory_hostname }}-client-happ.txt"
+    msg: >-
+      {{
+        ['Done. Happ links saved under ' ~ xray_client_output_dir ~ ':']
+        + (xray_clients | map(attribute='name')
+           | map('regex_replace', '^(.*)$', inventory_hostname ~ '-\1-client-happ.txt')
+           | list)
+      }}
 
 # === 7. Firewall ===
 
@@ -217,6 +156,12 @@
       community.general.ufw:
         rule: allow
         port: "{{ xray_ssh_port }}"
+        proto: tcp
+
+    - name: Allow HTTP through UFW
+      community.general.ufw:
+        rule: allow
+        port: "80"
         proto: tcp
 
     - name: Allow Xray port through UFW

@@ -1,0 +1,118 @@
+---
+# nginx site + Let's Encrypt (Reality fallback on 127.0.0.1:8443)
+
+- name: Install nginx and certbot
+  ansible.builtin.apt:
+    name:
+      - nginx
+      - certbot
+    state: present
+
+- name: Ensure site web root exists
+  ansible.builtin.file:
+    path: "{{ xray_site_remote_dir }}"
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0755"
+
+- name: Sync camouflage site to VPS
+  ansible.builtin.copy:
+    src: "{{ xray_site_local_dir }}/"
+    dest: "{{ xray_site_remote_dir }}/"
+    owner: www-data
+    group: www-data
+    mode: preserve
+    directory_mode: "0755"
+
+- name: Remove default nginx site
+  ansible.builtin.file:
+    path: /etc/nginx/sites-enabled/default
+    state: absent
+  notify: Reload nginx
+
+- name: Check existing Let's Encrypt certificate
+  ansible.builtin.stat:
+    path: "{{ xray_cert_live_dir }}/fullchain.pem"
+  register: xray_cert_stat
+
+- name: Set SSL cert existence fact (pre-issue)
+  ansible.builtin.set_fact:
+    xray_ssl_cert_exists: "{{ xray_cert_stat.stat.exists | default(false) }}"
+
+- name: Deploy nginx site (HTTP; SSL block if cert already exists)
+  ansible.builtin.template:
+    src: nginx-site.conf.j2
+    dest: "{{ xray_nginx_site_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload nginx
+
+- name: Enable nginx site
+  ansible.builtin.file:
+    src: "{{ xray_nginx_site_path }}"
+    dest: "{{ xray_nginx_site_link }}"
+    state: link
+  notify: Reload nginx
+
+- name: Allow HTTP through UFW (ACME)
+  community.general.ufw:
+    rule: allow
+    port: "80"
+    proto: tcp
+    comment: ACME and camouflage HTTP
+  when: xray_configure_ufw
+
+- name: Ensure nginx is running before reload/certbot
+  ansible.builtin.systemd:
+    name: nginx
+    enabled: true
+    state: started
+
+- name: Flush handlers so nginx config is active before certbot
+  ansible.builtin.meta: flush_handlers
+
+- name: Issue Let's Encrypt certificate via webroot
+  when: not xray_cert_stat.stat.exists
+  ansible.builtin.command: >-
+    certbot certonly --non-interactive --agree-tos
+    --webroot -w {{ xray_site_remote_dir }}
+    {% if (xray_certbot_email | default('') | trim | length) > 0 %}
+    --email {{ xray_certbot_email | trim }}
+    {% else %}
+    --register-unsafely-without-email
+    {% endif %}
+    -d {{ xray_reality_server_names | join(' -d ') }}
+  register: xray_certbot_result
+  changed_when: >-
+    'Certificate not yet due for renewal' not in (xray_certbot_result.stdout | default(''))
+
+- name: Confirm certificate after issuance
+  ansible.builtin.stat:
+    path: "{{ xray_cert_live_dir }}/fullchain.pem"
+  register: xray_cert_stat_after
+
+- name: Fail if certificate is still missing
+  ansible.builtin.assert:
+    that:
+      - xray_cert_stat_after.stat.exists
+    fail_msg: >-
+      Let's Encrypt certificate was not created at {{ xray_cert_live_dir }}.
+      Check DNS, port 80, and certbot output.
+
+- name: Mark SSL cert as present
+  ansible.builtin.set_fact:
+    xray_ssl_cert_exists: true
+
+- name: Deploy nginx site with SSL Reality fallback
+  ansible.builtin.template:
+    src: nginx-site.conf.j2
+    dest: "{{ xray_nginx_site_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload nginx
+
+- name: Flush handlers after SSL nginx config
+  ansible.builtin.meta: flush_handlers

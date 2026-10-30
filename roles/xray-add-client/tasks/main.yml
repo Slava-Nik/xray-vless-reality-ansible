@@ -12,6 +12,13 @@
       - xray_client_name is match('^[a-zA-Z0-9][a-zA-Z0-9_-]*$')
     fail_msg: "Pass -e client_name=NAME (letters, numbers, hyphen, underscore)."
 
+- name: Require vpn_domain
+  ansible.builtin.assert:
+    that:
+      - vpn_domain is defined
+      - (vpn_domain | trim | length) > 0
+    fail_msg: "Set vpn_domain on the host in inventory/hosts.yml."
+
 - name: Check if xray binary exists
   ansible.builtin.stat:
     path: "{{ xray_binary }}"
@@ -37,42 +44,51 @@
     src: "{{ xray_credentials_path }}"
   register: xray_credentials_slurp
 
+- name: Parse credentials
+  ansible.builtin.set_fact:
+    xray_creds_parsed: "{{ xray_credentials_slurp.content | b64decode | from_yaml }}"
+
 - name: Set server credential facts
   ansible.builtin.set_fact:
-    xray_primary_client_uuid: "{{ creds.client_uuid }}"
-    xray_private_key: "{{ creds.private_key }}"
-    xray_public_key: "{{ creds.public_key }}"
-    xray_short_id: "{{ creds.short_id }}"
+    xray_private_key: "{{ xray_creds_parsed.private_key }}"
+    xray_public_key: "{{ xray_creds_parsed.public_key }}"
+    xray_short_id: "{{ xray_creds_parsed.short_id }}"
+    xray_clients: "{{ _clients }}"
   vars:
-    creds: "{{ xray_credentials_slurp.content | b64decode | from_yaml }}"
-
-- name: Check extra clients registry
-  ansible.builtin.stat:
-    path: "{{ xray_clients_registry_path }}"
-  register: xray_extra_clients_stat
-
-- name: Read extra clients registry
-  ansible.builtin.slurp:
-    src: "{{ xray_clients_registry_path }}"
-  register: xray_extra_clients_slurp
-  when: xray_extra_clients_stat.stat.exists
-
-- name: Set extra clients list
-  ansible.builtin.set_fact:
-    xray_extra_clients: "{{ _registry.clients | default([]) }}"
-  vars:
-    _registry: >-
+    _from_creds: "{{ xray_creds_parsed.clients | default([]) }}"
+    _legacy: >-
       {{
-        (xray_extra_clients_slurp.content | b64decode | from_yaml)
-        if (xray_extra_clients_stat.stat.exists and not (xray_extra_clients_slurp.skipped | default(false)))
-        else {'clients': []}
+        [{'name': 'client-1', 'uuid': xray_creds_parsed.client_uuid | trim}]
+        if (xray_creds_parsed.client_uuid | default('') | trim | length) > 0
+           and (_from_creds | length) == 0
+        else []
       }}
+    _clients: "{{ _from_creds if (_from_creds | length) > 0 else _legacy }}"
+
+- name: Resolve www DNS for serverNames
+  ansible.builtin.command:
+    cmd: dig +short A www.{{ vpn_domain }}
+  register: xray_www_dig
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  failed_when: false
+
+- name: Set Reality serverNames
+  ansible.builtin.set_fact:
+    xray_reality_server_names: "{{ _names }}"
+  vars:
+    _www_ok: >-
+      {{
+        (ansible_host | string) in (xray_www_dig.stdout_lines | map('trim') | select('match', '^[0-9.]+$') | list)
+      }}
+    _names: "{{ [vpn_domain] + (['www.' ~ vpn_domain] if (_www_ok | bool) else []) }}"
 
 - name: Detect existing client by name
   ansible.builtin.set_fact:
-    xray_existing_client: "{{ _matches | first | default(none) }}"
+    xray_existing_client: "{{ (_matches | first) if (_matches | length) > 0 else none }}"
   vars:
-    _matches: "{{ xray_extra_clients | selectattr('name', 'equalto', xray_client_name) | list }}"
+    _matches: "{{ xray_clients | selectattr('name', 'equalto', xray_client_name) | list }}"
 
 - name: Reuse UUID when client already exists
   when: xray_existing_client is not none
@@ -86,25 +102,28 @@
   register: xray_new_client_uuid_cmd
   changed_when: true
 
-- name: Add new client to registry
+- name: Add new client to list
   when: xray_existing_client is none
   ansible.builtin.set_fact:
     xray_new_client_uuid: "{{ xray_new_client_uuid_cmd.stdout | trim }}"
     xray_client_already_exists: false
-    xray_extra_clients: >-
+    xray_clients: >-
       {{
-        xray_extra_clients + [{'name': xray_client_name, 'uuid': xray_new_client_uuid_cmd.stdout | trim}]
+        xray_clients + [{'name': xray_client_name, 'uuid': xray_new_client_uuid_cmd.stdout | trim}]
       }}
 
-- name: Save extra clients registry
+- name: Persist credentials with new client
   when: not xray_client_already_exists
   ansible.builtin.copy:
-    dest: "{{ xray_clients_registry_path }}"
+    dest: "{{ xray_credentials_path }}"
     mode: "0600"
     content: |
       ---
+      private_key: {{ xray_private_key }}
+      public_key: {{ xray_public_key }}
+      short_id: {{ xray_short_id }}
       clients:
-      {% for client in xray_extra_clients %}
+      {% for client in xray_clients %}
         - name: {{ client.name }}
           uuid: {{ client.uuid }}
       {% endfor %}
@@ -119,7 +138,6 @@
     mode: "0644"
     validate: "{{ xray_binary }} run -test -config %s"
 
-# Save local files before restart — restart can drop Ansible's shared SSH connection.
 - name: Ensure local output directory exists
   ansible.builtin.file:
     path: "{{ xray_client_output_dir }}"
@@ -128,26 +146,21 @@
   delegate_to: localhost
   become: false
 
-- name: Save new client config locally
-  ansible.builtin.template:
-    src: client-config.json.j2
-    dest: "{{ xray_client_output_dir }}/{{ inventory_hostname }}-{{ xray_client_name }}-client-config.json"
-    mode: "0600"
-  delegate_to: localhost
-  become: false
-
 - name: Save new client happ link locally
   ansible.builtin.template:
     src: client-happ.txt.j2
     dest: "{{ xray_client_output_dir }}/{{ inventory_hostname }}-{{ xray_client_name }}-client-happ.txt"
     mode: "0600"
+  vars:
+    client:
+      name: "{{ xray_client_name }}"
+      uuid: "{{ xray_new_client_uuid }}"
   delegate_to: localhost
   become: false
 
 - name: Restart xray and recover SSH
   when: not xray_client_already_exists
   block:
-    # Async so Ansible does not sit on the shared SSH socket while xray restarts.
     - name: Restart xray asynchronously
       ansible.builtin.systemd:
         name: xray
@@ -175,9 +188,8 @@
         name: xray
         state: started
 
-- name: Show client config paths
+- name: Show client happ path
   ansible.builtin.debug:
     msg:
-      - "{{ 'Client already existed on server; local configs refreshed.' if xray_client_already_exists else 'New client added on server.' }}"
-      - "Client config saved to: {{ xray_client_output_dir }}/{{ inventory_hostname }}-{{ xray_client_name }}-client-config.json"
+      - "{{ 'Client already existed on server; local happ link refreshed.' if xray_client_already_exists else 'New client added on server.' }}"
       - "Happ link saved to: {{ xray_client_output_dir }}/{{ inventory_hostname }}-{{ xray_client_name }}-client-happ.txt"

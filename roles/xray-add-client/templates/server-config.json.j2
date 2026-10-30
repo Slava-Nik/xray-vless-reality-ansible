@@ -11,14 +11,13 @@
       "protocol": "vless",
       "settings": {
         "clients": [
-          {
-            "id": "{{ xray_primary_client_uuid }}",
-            "flow": "{{ xray_client_flow }}"
-          }{% for client in xray_extra_clients %},
+{% for client in xray_clients %}
           {
             "id": "{{ client.uuid }}",
             "flow": "{{ xray_client_flow }}"
-          }{% endfor %}
+          }{% if not loop.last %},{% endif %}
+
+{% endfor %}
         ],
         "decryption": "none"
       },

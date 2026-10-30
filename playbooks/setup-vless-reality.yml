@@ -1,13 +1,15 @@
 ---
-# Deploy Xray VLESS + Reality on VPS
+# Deploy Xray VLESS + Reality + nginx camouflage site on VPS
+#
+# Prerequisites: vpn_domain in inventory, sites/<vpn_domain>/index.html, DNS A → VPS
 #
 # Run from repo root:
-#   ansible-playbook playbooks/setup-vless-reality.yml
+#   ansible-playbook playbooks/setup-vless-reality.yml --limit indiegateway
 #
 # Test SSH:
-#   ansible vps -m ping
+#   ansible vps -m ping --limit indiegateway
 
-- name: Deploy VLESS + Reality (Xray)
+- name: Deploy VLESS + Reality (Xray) with nginx camouflage
   hosts: vps
   gather_facts: true
 

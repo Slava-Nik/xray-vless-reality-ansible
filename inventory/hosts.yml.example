@@ -6,3 +6,6 @@ all:
           ansible_host: 203.0.113.10
           ansible_user: root
           ansible_ssh_private_key_file: ~/.ssh/id_ed25519
+          # Domain used for Reality SNI + nginx camouflage site.
+          # Must match folder name under sites/<vpn_domain>/
+          vpn_domain: example.com

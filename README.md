@@ -1,43 +1,44 @@
 # Xray VLESS + Reality (Ansible setup)
 
-One-command deploy of Xray with VLESS + Reality on a VPS. Client configs are saved to `output/<server-ip>/`.
+One-command deploy of Xray with VLESS + Reality on a VPS. Without a valid client key, the server shows your own nginx site. Happ `vless://` links are saved to `output/<server-ip>/` (3 clients by default: `client-1` … `client-3`).
 
-## Quick start
+## Checklist (before deploy)
+
+1. **Domain** — buy at Namecheap (or any registrar).
+2. **DNS** — A record for `@` → VPS IP (optional: `www` → same IP or CNAME to `@`).
+3. **Site** — put static files in `sites/<your-domain>/` with `index.html` (see `sites/README.md`).
+4. **SSH** — key access to the VPS (`ssh-copy-id root@YOUR_IP`).
+5. **Inventory** — copy and edit hosts file:
 
 ```bash
-# 1. Install
+cp inventory/hosts.yml.example inventory/hosts.yml
+# set: ansible_host, ansible_ssh_private_key_file, vpn_domain
+# vpn_domain must match the folder name under sites/
+```
+
+6. **Deploy** (limit to one host if inventory has several):
+
+```bash
 brew install ansible
 ansible-galaxy collection install -r requirements.yml
-
-# 2. Add your server
-cp inventory/hosts.yml.example inventory/hosts.yml
-# edit inventory/hosts.yml — IP, user, SSH key
-
-# 3. Deploy
-ansible vps -m ping
-ansible-playbook playbooks/setup-vless-reality.yml
-
-# 4. Connect
-# import output/<server-ip>/my-vps-client-config.json into Nekoray / v2rayN / Hiddify / v2rayNG
-# or paste the vless:// link from output/<server-ip>/my-vps-client-happ.txt into Happ
+ansible vps -m ping --limit indiegateway
+ansible-playbook playbooks/setup-vless-reality.yml --limit indiegateway
 ```
+
+The playbook checks `index.html` and that DNS A points at the VPS, then installs nginx + Let's Encrypt, configures Reality fallback to your site, and writes Happ links.
+
+7. **Connect** — paste the `vless://` link from e.g. `output/<ip>/indiegateway-client-1-client-happ.txt` into Happ.
 
 ## Add another client
 
-If you need to add an extra client to your server:
-
 ```bash
-ansible-playbook playbooks/add-another-vless-client.yml -e client_name=john
+ansible-playbook playbooks/add-another-vless-client.yml -e client_name=john --limit indiegateway
 ```
 
-Output: `output/<server-ip>/my-vps-john-client-config.json` and `output/<server-ip>/my-vps-john-client-happ.txt`
-
-Re-running with the same `client_name` only refreshes local files (does not recreate the client).
-
-Do not re-run `setup-vless-reality.yml` after adding clients — it resets the server to a single client.
+Re-running with the same `client_name` only refreshes local files. Re-running `setup-vless-reality.yml` keeps existing clients in server credentials and only adds missing default `client-1`…`client-3` if needed.
 
 ## Requirements
 
-- Ubuntu/Debian VPS with SSH key access (`ssh-copy-id root@YOUR_IP`)
-- macOS or Linux with Ansible
-
+- Ubuntu/Debian VPS with SSH key access
+- macOS or Linux with Ansible (`dig` available locally for DNS checks)
+- Domain A record already pointing at the VPS
